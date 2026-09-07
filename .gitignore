@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.log
+.smoke/
+.dev/
+.pi/handoff/
+.pi/plan/
+.pi/sessions/
+.pi/auto-handoff.local.json
