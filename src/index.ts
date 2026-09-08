@@ -5,14 +5,13 @@ import { envOverrides, mergeConfigSources, type PluginConfig } from "./config.ts
 import type { AgentMessageLike } from "./messages.ts"
 import {
   applyContextTransform,
-  considerTrigger,
   createRuntime,
   noteAssistantUsage,
   noteToolEnd,
   noteToolStart,
   onUserMessage,
   refreshOccupancy,
-  renderedHandoffPrompt,
+  restoreFromBranch,
   runIdlePlan,
   statusSnapshot,
   type Runtime,
@@ -42,7 +41,6 @@ function loadConfig(cwd: string): PluginConfig {
 function usageFromAssistant(message: {
   role: string
   usage?: PiTokenUsage
-  stopReason?: string
 }): PiTokenUsage | null {
   if (message.role !== "assistant") return null
   const usage = message.usage
@@ -65,6 +63,8 @@ function bindRuntime(pi: ExtensionAPI, ctx: ExtensionContext, existing: Runtime 
     existing.hooks.getContextUsage = () => ctx.getContextUsage()
     existing.hooks.getModelContextWindow = () => ctx.model?.contextWindow
     existing.hooks.sessionId = () => ctx.sessionManager.getSessionId()
+    existing.hooks.readBranchEntries = () =>
+      ctx.sessionManager.getBranch().map((entry) => entry as unknown as Record<string, unknown>)
     existing.sessionID = ctx.sessionManager.getSessionId()
     return existing
   }
@@ -78,6 +78,8 @@ function bindRuntime(pi: ExtensionAPI, ctx: ExtensionContext, existing: Runtime 
       getContextUsage: () => ctx.getContextUsage(),
       getModelContextWindow: () => ctx.model?.contextWindow,
       sessionId: () => ctx.sessionManager.getSessionId(),
+      readBranchEntries: () =>
+        ctx.sessionManager.getBranch().map((entry) => entry as unknown as Record<string, unknown>),
     },
   })
 }
@@ -90,17 +92,17 @@ export default function autoHandoffExtension(pi: ExtensionAPI): void {
     return rt
   }
 
-  pi.on("session_start", (_event, ctx) => {
-    runtime(ctx)
+  pi.on("session_start", (event, ctx) => {
+    const current = runtime(ctx)
+    if (event.reason === "resume" || event.reason === "startup") {
+      restoreFromBranch(current)
+    }
   })
 
   pi.on("message_end", (event, ctx) => {
     const current = runtime(ctx)
     if (event.message.role === "assistant") {
-      const stop = "stopReason" in event.message ? event.message.stopReason : undefined
-      const completed = stop !== "aborted" && stop !== "error"
-      noteAssistantUsage(current, usageFromAssistant(event.message), false)
-      if (completed) refreshOccupancy(current)
+      noteAssistantUsage(current, usageFromAssistant(event.message))
     }
     if (event.message.role === "user") {
       onUserMessage(current, event.message as AgentMessageLike)
@@ -108,10 +110,8 @@ export default function autoHandoffExtension(pi: ExtensionAPI): void {
   })
 
   pi.on("turn_end", (_event, ctx) => {
-    const current = runtime(ctx)
-    noteAssistantUsage(current, current.lastUsage, true)
-    refreshOccupancy(current)
-    considerTrigger(current)
+    // Log/occupancy refresh only. The trigger lives in the context event (v2).
+    refreshOccupancy(runtime(ctx))
   })
 
   pi.on("tool_execution_start", (_event, ctx) => {
@@ -119,31 +119,20 @@ export default function autoHandoffExtension(pi: ExtensionAPI): void {
   })
 
   pi.on("tool_execution_end", (_event, ctx) => {
-    const current = runtime(ctx)
-    noteToolEnd(current)
-  })
-
-  pi.on("before_agent_start", (event, ctx) => {
-    const current = runtime(ctx)
-    refreshOccupancy(current)
-    considerTrigger(current)
-    const extra = renderedHandoffPrompt(current)
-    if (!extra) return
-    return { systemPrompt: `${event.systemPrompt}\n\n<!-- pi-auto-handoff -->\n${extra}` }
+    noteToolEnd(runtime(ctx))
   })
 
   pi.on("context", (event, ctx) => {
     const current = runtime(ctx)
     const messages = event.messages as AgentMessageLike[]
-    applyContextTransform(current, messages)
-    return { messages: event.messages }
+    const outcome = applyContextTransform(current, messages)
+    return { messages: outcome.messages as typeof event.messages }
   })
 
   pi.on("agent_end", (_event, ctx) => {
-    const current = runtime(ctx)
-    refreshOccupancy(current)
-    considerTrigger(current)
-    runIdlePlan(current)
+    // Not a handoff delivery channel (v2). Only relights a written handoff
+    // when the model has already stopped, so the same session continues.
+    runIdlePlan(runtime(ctx))
   })
 
   pi.registerCommand("auto-handoff", {

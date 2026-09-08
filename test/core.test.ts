@@ -2,7 +2,6 @@ import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import { envOverrides, parseConfig } from "../src/config.ts"
 import { applyClear, applyFilterSince, verifyHandoffBody } from "../src/messages.ts"
-import { appendHandoffMarker, newlyCompleted, parsePlan } from "../src/plan.ts"
 import { nextHandoffPath } from "../src/paths.ts"
 import { render } from "../src/templates.ts"
 import {
@@ -38,59 +37,24 @@ describe("usage", () => {
   })
 })
 
-describe("parsePlan", () => {
-  it("reads checkbox and table WPs plus handoff markers", () => {
-    const md = `
-# Plan
-- [x] **WP-1** Spike
-- [ ] **WP-2** Implement
-
-| ID | Status | Notes |
-| --- | --- | --- |
-| WP-03 | in-progress | coding |
-| WP-04 | blocked | wait |
-
-<!-- handoff n=2 file=.pi/handoff-002.md ts=2026-09-02T00:00:00Z -->
-`
-    const snap = parsePlan(md)
-    assert.deepEqual(
-      snap.packages.map((p) => [p.id, p.status]),
-      [
-        ["WP-03", "in-progress"],
-        ["WP-04", "blocked"],
-        ["WP-1", "done"],
-        ["WP-2", "todo"],
-      ],
-    )
-    assert.equal(snap.handoffCount, 2)
-  })
-
-  it("detects a WP that just completed", () => {
-    const prev = parsePlan("- [ ] **WP-1** A\n- [ ] **WP-2** B\n")
-    const next = parsePlan("- [x] **WP-1** Spike\n- [ ] **WP-2** Implement\n")
-    assert.deepEqual(newlyCompleted(prev, next), ["WP-1"])
-    assert.deepEqual(newlyCompleted(next, next), [])
-  })
-
-  it("appends a handoff marker without duplicating", () => {
-    const once = appendHandoffMarker("# Plan\n<!-- handoffs -->\n", {
-      n: 1,
-      file: "a.md",
-      ts: "t",
-    })
-    assert.match(once, /handoff n=1/)
-    const twice = appendHandoffMarker(once, { n: 1, file: "a.md", ts: "t" })
-    assert.equal(twice, once)
-  })
-})
-
 describe("config", () => {
   it("clamps and fills defaults", () => {
-    const cfg = parseConfig({ contextThreshold: 0.2, hardCeiling: 0.1, enabled: false })
+    const cfg = parseConfig({ contextThreshold: 0.2, enabled: false })
     assert.equal(cfg.contextThreshold, 0.2)
-    assert.equal(cfg.hardCeiling, 0.2)
     assert.equal(cfg.enabled, false)
     assert.equal(cfg.handoffDir, ".pi/handoff")
+    assert.equal(parseConfig({}).contextThreshold, 0.5)
+  })
+
+  it("clamps out-of-range thresholds", () => {
+    assert.equal(parseConfig({ contextThreshold: 5 }).contextThreshold, 1)
+    assert.equal(parseConfig({ contextThreshold: -1 }).contextThreshold, 0)
+  })
+
+  it("ignores removed v1 keys (hardCeiling, minTurnsBetweenHandoffs)", () => {
+    const cfg = parseConfig({ hardCeiling: 0.9, minTurnsBetweenHandoffs: 3 } as Record<string, unknown>)
+    assert.equal("hardCeiling" in cfg, false)
+    assert.equal("minTurnsBetweenHandoffs" in cfg, false)
   })
 
   it("reads PI_AUTO_HANDOFF_* env overrides", () => {
@@ -103,6 +67,14 @@ describe("config", () => {
     assert.equal(cfg.contextThreshold, 0.0001)
     assert.equal(cfg.handoffDir, "/tmp/h")
     assert.equal(cfg.enabled, true)
+  })
+
+  it("no env mapping remains for removed keys", () => {
+    const env = envOverrides({
+      PI_AUTO_HANDOFF_HARD_CEILING: "0.9",
+      PI_AUTO_HANDOFF_MIN_TURNS: "3",
+    })
+    assert.deepEqual(env, {})
   })
 })
 
@@ -120,6 +92,11 @@ describe("handoff path and template", () => {
       handoffNumber: "3",
     })
     assert.equal(out, "path=/tmp/h.md n=3")
+  })
+
+  it("leaves unknown placeholders empty rather than literal", () => {
+    const out = render("x={{unknown}} y=1", { y: "1" } as Record<string, string>)
+    assert.equal(out, "x= y=1")
   })
 
   it("rejects incomplete handoff bodies and accepts required sections", () => {

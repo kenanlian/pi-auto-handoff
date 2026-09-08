@@ -1,43 +1,42 @@
-You are writing a HANDOFF document for a successor instance of yourself in this same Pi session.
+[pi-auto-handoff] CONTEXT CRITICAL — WRITE HANDOFF NOW
 
-Write the document to this exact path (create/overwrite):
+Your context window is at or past {{threshold}} of its limit (current ratio {{ratio}}). If you keep working, the next tool results will push this run past its usable context and the work will degrade or stall.
+
+You are FORBIDDEN from continuing the original task. From this point on you may use ONLY the minimal tool calls needed to write the handoff document (e.g. one read of the plan file). Do not start or continue any work package. Do not run more task tools. Do not reply with a task-progress answer.
+
+Write the handoff document to this exact path (create/overwrite, nothing else in the file):
 
 {{handoffPath}}
 
-Then update the plan file at `{{planFile}}` by appending a handoff marker that matches existing WP markup, for example:
-
-<!-- handoff n={{handoffNumber}} file={{handoffPath}} ts={{timestamp}} -->
-
-Do not summarize chat history. Write concise operational state plus path pointers.
-
-{{hardCeilingNote}}
-
-Required sections:
+Required sections — all six, in this order, as `##` headings (the file is machine-verified):
 
 # Handoff {{handoffNumber}}
 
 - Timestamp: {{timestamp}}
-- Reason: {{reason}}
 
 ## Task goal
-One short paragraph.
+One short paragraph: what the overall task is and who/what it is for.
 
 ## Work packages
-For every WP in `{{planFile}}`: status (`done` / `in-progress` / `blocked` / `todo`) and one line of explanation.
+Every work package from the plan file `{{planFile}}` with its current status (`done` / `in-progress` / `blocked` / `todo`) and one line each.
 
 ## Pointers
 - Plan file: `{{planFile}}`
 - This handoff: `{{handoffPath}}`
-- Key files (paths only)
+- Key files the successor must touch (absolute or repo-relative paths only)
 - Relevant git commits (hashes only, if any)
 
 ## Exact interrupt point
-Where work stopped. Be precise (file, WP, unfinished check).
+Where work stopped right now. Be surgical: file path, function or WP, the last completed step, the unfinished check.
 
 ## Next actions
-The next WP and the first concrete step.
+The immediate next work package and its first concrete step.
 
 ## Risks and constraints
-Anything the successor must not redo or violate.
+Anything the successor must not redo, must not violate, or will likely trip over.
 
-After the file is on disk, stop. Do not start the next work package and do not keep reading files. A successor turn will resume automatically.
+When the file is written, end your turn immediately with the single line:
+
+HANDOFF WRITTEN
+
+Do not do anything else after writing the file. The session will be continued for you automatically.

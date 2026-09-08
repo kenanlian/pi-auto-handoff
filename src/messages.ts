@@ -36,12 +36,25 @@ export function messageKey(message: AgentMessageLike): string {
   return `${message.role}:${message.timestamp ?? 0}`
 }
 
-export function continuationUser(text: string, timestamp = Date.now()): AgentMessageLike {
+/** Fixed stable key for the synthetic injected directive. Never Date.now(). */
+export function injectKey(handoffNumber: number): string {
+  return `handoff-inject:${handoffNumber}`
+}
+
+export function continuationUser(text: string, timestamp = 0): AgentMessageLike {
   return {
     role: "user",
     content: [{ type: "text", text }],
     timestamp,
   }
+}
+
+/** Match `<!-- pi-auto-handoff-continuation n=... -->` inside a user message; returns n or null. */
+export function continuationMarker(text: string): number | null {
+  const match = /<!--\s*pi-auto-handoff-continuation\s+n=(\d+)\s*-->/.exec(text)
+  if (!match) return null
+  const n = Number(match[1])
+  return Number.isFinite(n) ? n : null
 }
 
 export function idsOf(messages: AgentMessageLike[]): string[] {

@@ -1,18 +1,8 @@
-export type Phase =
-  | "idle"
-  | "monitoring"
-  | "handoff-requested"
-  | "clearing"
-  | "cleared"
-  | "continuation-injected"
-
-export type TriggerReason = "threshold-wp" | "hard-ceiling"
+export type Phase = "monitoring" | "injecting" | "written"
 
 export type MachineState = {
   phase: Phase
-  lastTrigger: TriggerReason | null
   handoffAttempts: number
-  turnsSinceHandoff: number
   lastHandoffNumber: number
 }
 
@@ -20,41 +10,31 @@ export type EvaluateInput = {
   enabled: boolean
   ratio: number
   threshold: number
-  hardCeiling: number
-  wpBoundary: boolean
-  turnsSinceHandoff: number
-  minTurnsBetweenHandoffs: number
   phase: Phase
 }
 
 export function initialState(): MachineState {
   return {
-    phase: "idle",
-    lastTrigger: null,
+    phase: "monitoring",
     handoffAttempts: 0,
-    turnsSinceHandoff: 0,
     lastHandoffNumber: 0,
   }
 }
 
-export function evaluateTrigger(input: EvaluateInput): TriggerReason | null {
-  if (!input.enabled) return null
-  if (input.phase === "handoff-requested" || input.phase === "clearing" || input.phase === "cleared") return null
-  if (input.turnsSinceHandoff < input.minTurnsBetweenHandoffs) return null
-  if (input.ratio >= input.hardCeiling) return "hard-ceiling"
-  if (input.ratio >= input.threshold && input.wpBoundary) return "threshold-wp"
-  return null
+/** v2 single threshold: fire on the next context event while still monitoring. */
+export function evaluateTrigger(input: EvaluateInput): boolean {
+  if (!input.enabled) return false
+  if (input.phase !== "monitoring") return false
+  return input.ratio >= input.threshold
 }
 
 export type Transition =
   | { type: "start-monitoring" }
-  | { type: "request-handoff"; reason: TriggerReason }
+  | { type: "request-handoff" }
   | { type: "handoff-written" }
   | { type: "handoff-retry" }
   | { type: "handoff-give-up" }
   | { type: "cleared" }
-  | { type: "continuation-injected" }
-  | { type: "turn-completed" }
 
 export function reduce(state: MachineState, event: Transition): MachineState {
   switch (event.type) {
@@ -63,21 +43,21 @@ export function reduce(state: MachineState, event: Transition): MachineState {
     case "request-handoff":
       return {
         ...state,
-        phase: "handoff-requested",
-        lastTrigger: event.reason,
+        phase: "injecting",
         handoffAttempts: 1,
       }
     case "handoff-written":
-      return { ...state, phase: "clearing", handoffAttempts: 0, lastHandoffNumber: state.lastHandoffNumber + 1 }
+      return {
+        ...state,
+        phase: "written",
+        handoffAttempts: 0,
+        lastHandoffNumber: state.lastHandoffNumber + 1,
+      }
     case "handoff-retry":
-      return { ...state, phase: "handoff-requested", handoffAttempts: state.handoffAttempts + 1 }
+      return { ...state, phase: "injecting", handoffAttempts: state.handoffAttempts + 1 }
     case "handoff-give-up":
-      return { ...state, phase: "monitoring", lastTrigger: null, handoffAttempts: 0 }
+      return { ...state, phase: "monitoring", handoffAttempts: 0 }
     case "cleared":
-      return { ...state, phase: "cleared" }
-    case "continuation-injected":
-      return { ...state, phase: "monitoring", lastTrigger: null, turnsSinceHandoff: 0 }
-    case "turn-completed":
-      return { ...state, turnsSinceHandoff: state.turnsSinceHandoff + 1 }
+      return { ...state, phase: "monitoring" }
   }
 }

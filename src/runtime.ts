@@ -5,7 +5,6 @@ import {
   createCycle,
   decideIdle,
   decideTransform,
-  injectHandoffSystem,
   markWritten,
   noteClearedLogged,
   noteContinuationPrompted,
@@ -19,14 +18,15 @@ import { createLogger, type Logger } from "./log.ts"
 import {
   applyClear,
   applyFilterSince,
+  continuationMarker,
   idsOf,
+  injectKey,
   messageKey,
   verifyHandoffBody,
   type AgentMessageLike,
 } from "./messages.ts"
-import { evaluateTrigger, initialState, reduce, type MachineState, type TriggerReason } from "./machine.ts"
+import { evaluateTrigger, initialState, reduce, type MachineState } from "./machine.ts"
 import { abs, eventsLogPath, nextHandoffPath } from "./paths.ts"
-import { appendHandoffMarker, newlyCompleted, nextIncomplete, parsePlan, type PlanSnapshot } from "./plan.ts"
 import { bundledContinuationPrompt, bundledHandoffPrompt, loadText, render } from "./templates.ts"
 import {
   hasAuthoritativeContextUsage,
@@ -40,7 +40,6 @@ import {
 export type PendingHandoff = {
   path: string
   number: number
-  reason: TriggerReason
   startedAt: number
   attempt: number
 }
@@ -52,6 +51,7 @@ export type RuntimeHooks = {
   getContextUsage?: () => ContextUsageSnapshot | undefined
   getModelContextWindow?: () => number | undefined
   sessionId?: () => string | undefined
+  readBranchEntries?: () => Array<Record<string, unknown>> | undefined
 }
 
 export type Runtime = {
@@ -66,18 +66,20 @@ export type Runtime = {
   lastUsage: PiTokenUsage | null
   lastRatio: number
   inFlightTools: number
-  plan: PlanSnapshot | null
   pending: PendingHandoff | null
   injecting: boolean
+  injectCount: number
+  /** After a clear/restore, distrust stale getContextUsage until a fresh assistant usage arrives. */
+  awaitingFreshUsage: boolean
+  /**
+   * Re-arm guard: after a clear, a new handoff fires only once an authoritative
+   * ratio has been observed BELOW the threshold again (context genuinely
+   * regrown past it). Cold start begins armed.
+   */
+  armed: boolean
   handoffPrompt: string
   continuationTemplate: string
   hooks: RuntimeHooks
-}
-
-function readPlan(cfg: PluginConfig, directory: string): PlanSnapshot | null {
-  const file = abs(directory, cfg.planFile)
-  if (!existsSync(file)) return null
-  return parsePlan(readFileSync(file, "utf8"))
 }
 
 function loadPrompts(cfg: PluginConfig, directory: string): { handoff: string; continuation: string } {
@@ -93,42 +95,28 @@ function loadPrompts(cfg: PluginConfig, directory: string): { handoff: string; c
 }
 
 export function handoffVars(rt: Runtime, pending: PendingHandoff): Record<string, string> {
-  const hard =
-    pending.reason === "hard-ceiling"
-      ? "HARD CEILING: finish the current WP, persist plan/state to disk, then write this handoff. Do not start new WPs."
-      : ""
   return {
     handoffPath: pending.path,
     planFile: rt.cfg.planFile,
     handoffNumber: String(pending.number),
     timestamp: new Date(pending.startedAt).toISOString(),
-    reason: pending.reason,
-    hardCeilingNote: hard,
+    reason: "context-threshold",
+    ratio: rt.lastRatio.toFixed(3),
+    threshold: String(rt.cfg.contextThreshold),
   }
 }
 
-export function renderedHandoffPrompt(rt: Runtime): string | null {
-  if (!rt.pending || !injectHandoffSystem(rt.cycle)) return null
-  return render(rt.handoffPrompt, handoffVars(rt, rt.pending))
-}
-
-function markPlan(rt: Runtime, pending: PendingHandoff): void {
-  const file = abs(rt.directory, rt.cfg.planFile)
-  if (!existsSync(file)) return
-  const next = appendHandoffMarker(readFileSync(file, "utf8"), {
-    n: pending.number,
-    file: pending.path,
-    ts: new Date(pending.startedAt).toISOString(),
-  })
-  writeFileSync(file, next)
+export function injectDirective(rt: Runtime, pending: PendingHandoff): string {
+  return render(rt.handoffPrompt, handoffVars(rt, pending))
 }
 
 function continuationFor(rt: Runtime, pending: PendingHandoff): string {
-  const next = readPlan(rt.cfg, rt.directory)
   return render(rt.continuationTemplate, {
     handoffPath: pending.path,
     planFile: rt.cfg.planFile,
-    nextWp: nextIncomplete(next ?? { packages: [], handoffCount: 0 })?.id ?? "next incomplete WP",
+    handoffNumber: String(pending.number),
+    handoffBody: existsSync(pending.path) ? readFileSync(pending.path, "utf8") : "(handoff file missing)",
+    continuationNumber: String(pending.number),
   })
 }
 
@@ -154,6 +142,56 @@ function writeEventFile(rt: Runtime, level: string, message: string, extra?: Rec
       // ignore
     }
   }
+}
+
+function scanContinuationMarker(rt: Runtime): { n: number; ids: string[]; markerText: string } | null {
+  const read = rt.hooks.readBranchEntries
+  if (!read) return null
+  let entries: Array<Record<string, unknown>> | undefined
+  try {
+    entries = read()
+  } catch {
+    return null
+  }
+  if (!Array.isArray(entries)) return null
+  // Locate the newest continuation marker and snapshot every message id at or before it.
+  let markerIndex = -1
+  let n = 0
+  let markerText = ""
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i]
+    const message = entry?.message as AgentMessageLike | undefined
+    if (!message || message.role !== "user") continue
+    const text = textOfMessage(message)
+    const found = continuationMarker(text)
+    if (found) {
+      markerIndex = i
+      n = found
+      markerText = text
+      break
+    }
+  }
+  if (markerIndex < 0) return null
+  const ids: string[] = []
+  for (let i = 0; i <= markerIndex; i++) {
+    const message = entries[i]?.message as AgentMessageLike | undefined
+    if (message && typeof message.role === "string") ids.push(messageKey(message))
+  }
+  return { n, ids, markerText }
+}
+
+function textOfMessage(message: AgentMessageLike): string {
+  const content = message.content
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  const parts: string[] = []
+  for (const block of content) {
+    if (block && typeof block === "object" && (block as { type?: string }).type === "text") {
+      const text = (block as { text?: unknown }).text
+      if (typeof text === "string") parts.push(text)
+    }
+  }
+  return parts.join("\n")
 }
 
 export function createRuntime(input: {
@@ -185,9 +223,11 @@ export function createRuntime(input: {
     lastUsage: null,
     lastRatio: 0,
     inFlightTools: 0,
-    plan: readPlan(input.cfg, input.directory),
     pending: null,
     injecting: false,
+    injectCount: 0,
+    awaitingFreshUsage: false,
+    armed: true,
     handoffPrompt: prompts.handoff,
     continuationTemplate: prompts.continuation,
     hooks: input.hooks,
@@ -196,7 +236,6 @@ export function createRuntime(input: {
   rt.log.log("info", "plugin-loaded", {
     enabled: rt.cfg.enabled,
     contextThreshold: rt.cfg.contextThreshold,
-    hardCeiling: rt.cfg.hardCeiling,
     handoffDir: rt.cfg.handoffDir,
     planFile: rt.cfg.planFile,
     assumedContextLimit: rt.cfg.assumedContextLimit,
@@ -204,16 +243,14 @@ export function createRuntime(input: {
   return rt
 }
 
-export function requestHandoff(rt: Runtime, reason: TriggerReason): void {
-  const plan = readPlan(rt.cfg, rt.directory)
-  const n = (plan?.handoffCount ?? rt.state.lastHandoffNumber) + 1
+export function requestHandoff(rt: Runtime): void {
+  const n = rt.state.lastHandoffNumber + 1
   if (!cycleRequest(rt.cycle, n)) return
   const path = nextHandoffPath(rt.cfg.handoffDir, rt.directory, n)
-  rt.pending = { path, number: n, reason, startedAt: Date.now(), attempt: 1 }
-  rt.state = reduce(rt.state, { type: "request-handoff", reason })
+  rt.pending = { path, number: n, startedAt: Date.now(), attempt: 1 }
+  rt.state = reduce(rt.state, { type: "request-handoff" })
   rt.log.log("info", "handoff-requested", {
     phase: rt.state.phase,
-    reason,
     path,
     number: n,
     ratio: rt.lastRatio,
@@ -231,7 +268,6 @@ export function onHandoffVerified(rt: Runtime): void {
   if (!rt.pending) return
   const cont = continuationFor(rt, rt.pending)
   if (!markWritten(rt.cycle, rt.pending.number, cont)) return
-  markPlan(rt, rt.pending)
   rt.lastRatio = 0
   rt.lastUsage = null
   rt.state = reduce(rt.state, { type: "handoff-written" })
@@ -239,7 +275,7 @@ export function onHandoffVerified(rt: Runtime): void {
 }
 
 export function maybeTimeout(rt: Runtime, now: number): void {
-  if (!rt.pending || rt.state.phase !== "handoff-requested") return
+  if (!rt.pending || rt.state.phase !== "injecting") return
   if (now - rt.pending.startedAt < rt.cfg.handoffTimeoutMs) return
   if (rt.pending.attempt < 2) {
     rt.pending.attempt += 1
@@ -262,9 +298,12 @@ export function refreshOccupancy(rt: Runtime): void {
     rt.log.log("warn", "assumed-context-limit", { assumedContextLimit: rt.cfg.assumedContextLimit })
   }
 
+  if (rt.awaitingFreshUsage) return
+
   const ctxUsage = rt.hooks.getContextUsage?.()
   if (hasAuthoritativeContextUsage(ctxUsage)) {
     rt.lastRatio = occupancyFromContextUsage(ctxUsage)
+    if (rt.lastRatio < rt.cfg.contextThreshold) rt.armed = true
     if (typeof ctxUsage?.tokens === "number") {
       rt.log.log("debug", "usage", {
         contextTokens: ctxUsage.tokens,
@@ -277,6 +316,7 @@ export function refreshOccupancy(rt: Runtime): void {
   }
   if (hasAuthoritativeUsage(rt.lastUsage) && rt.limit > 0) {
     rt.lastRatio = occupancy(rt.lastUsage, rt.limit)
+    if (rt.lastRatio < rt.cfg.contextThreshold) rt.armed = true
     rt.log.log("debug", "usage", {
       contextTokens: rt.lastUsage ? rt.lastUsage.input + rt.lastUsage.output + (rt.lastUsage.cacheRead ?? 0) + (rt.lastUsage.cacheWrite ?? 0) : 0,
       limit: rt.limit,
@@ -286,60 +326,47 @@ export function refreshOccupancy(rt: Runtime): void {
   }
 }
 
-export function considerTrigger(rt: Runtime): void {
-  if (rt.inFlightTools > 0) return
-  if (rt.pending) {
-    if (verifyHandoffFile(rt)) onHandoffVerified(rt)
-    else maybeTimeout(rt, Date.now())
-    return
-  }
-  const plan = readPlan(rt.cfg, rt.directory)
-  const newly = newlyCompleted(rt.plan, plan ?? { packages: [], handoffCount: 0 })
-  rt.plan = plan
-  const reason = evaluateTrigger({
-    enabled: rt.cfg.enabled,
-    ratio: rt.lastRatio,
-    threshold: rt.cfg.contextThreshold,
-    hardCeiling: rt.cfg.hardCeiling,
-    wpBoundary: newly.length > 0,
-    turnsSinceHandoff: rt.state.turnsSinceHandoff,
-    minTurnsBetweenHandoffs: rt.cfg.minTurnsBetweenHandoffs,
-    phase: rt.state.phase,
-  })
-  if (!reason) return
-  requestHandoff(rt, reason)
-}
-
-export function noteAssistantUsage(rt: Runtime, usage: PiTokenUsage | null | undefined, completed: boolean): void {
-  if (hasAuthoritativeUsage(usage)) {
-    rt.lastUsage = usage ?? null
-  }
-  if (completed) {
-    rt.state = reduce(rt.state, { type: "turn-completed" })
-  }
-}
-
-export function noteToolStart(rt: Runtime): void {
-  rt.inFlightTools += 1
-}
-
-export function noteToolEnd(rt: Runtime): void {
-  rt.inFlightTools = Math.max(0, rt.inFlightTools - 1)
-  if (rt.pending && verifyHandoffFile(rt)) onHandoffVerified(rt)
-}
-
+/**
+ * v2 trigger point: the `context` event (fired before every LLM call).
+ * Threshold breach while monitoring → request handoff, then inject the directive
+ * into this very call's message array (mid-run; no run boundary needed).
+ */
 export function applyContextTransform(rt: Runtime, messages: AgentMessageLike[]): {
   messages: AgentMessageLike[]
-  result: ReturnType<typeof applyClear> | ReturnType<typeof applyFilterSince> | null
+  injected: boolean
 } {
+  refreshOccupancy(rt)
   considerTrigger(rt)
+  let injected = false
+  if (rt.pending && rt.state.phase === "injecting") {
+    const directive = injectDirective(rt, rt.pending)
+    if (directive) {
+      messages.push({
+        role: "user",
+        content: [{ type: "text", text: directive }],
+        timestamp: 0,
+      })
+      rt.injectCount += 1
+      injected = true
+      rt.log.log("info", "handoff-injected", {
+        key: injectKey(rt.pending.number),
+        number: rt.pending.number,
+        path: rt.pending.path,
+        ratio: rt.lastRatio,
+        sessionID: rt.sessionID ?? rt.hooks.sessionId?.(),
+      })
+    }
+  }
   const plan = decideTransform(rt.cycle)
-  if (plan.kind === "none") return { messages, result: null }
   if (plan.kind === "first-clear") {
     const before = idsOf(messages)
     const result = applyClear(messages, { replacementText: plan.continuationText })
     noteFirstClear(rt.cycle, before)
     rt.state = reduce(rt.state, { type: "cleared" })
+    rt.pending = null
+    rt.awaitingFreshUsage = true
+    rt.lastRatio = 0
+    rt.armed = false
     if (plan.logCleared) {
       rt.log.log("info", "clearing", {
         sessionID: rt.sessionID ?? rt.hooks.sessionId?.(),
@@ -355,21 +382,54 @@ export function applyContextTransform(rt: Runtime, messages: AgentMessageLike[])
         after: messages.length,
       })
     }
-    return { messages, result }
+    return { messages, injected }
   }
   if (plan.kind === "filter-since") {
-    const result = applyFilterSince(messages, plan.preClearIds, plan.continuationText)
-    return { messages, result }
+    applyFilterSince(messages, plan.preClearIds, plan.continuationText)
+    return { messages, injected }
   }
-  const result = applyClear(messages, { keepFromId: plan.keepFromId })
-  if (plan.logCleared) {
-    noteClearedLogged(rt.cycle)
-    noteCursor(rt.cycle, plan.keepFromId)
-    rt.state = reduce(rt.state, { type: "cleared" })
-    rt.log.log("info", "clearing", { sessionID: rt.sessionID ?? rt.hooks.sessionId?.(), keepFromId: plan.keepFromId })
-    rt.log.log("info", "messages-cleared", result)
+  if (plan.kind === "filter-cursor") {
+    const result = applyClear(messages, { keepFromId: plan.keepFromId })
+    if (plan.logCleared) {
+      noteClearedLogged(rt.cycle)
+      noteCursor(rt.cycle, plan.keepFromId)
+      rt.state = reduce(rt.state, { type: "cleared" })
+      rt.log.log("info", "clearing", { sessionID: rt.sessionID ?? rt.hooks.sessionId?.(), keepFromId: plan.keepFromId })
+      rt.log.log("info", "messages-cleared", result)
+    }
   }
-  return { messages, result }
+  return { messages, injected }
+}
+
+export function considerTrigger(rt: Runtime): void {
+  if (rt.inFlightTools > 0) return
+  if (rt.pending) {
+    if (verifyHandoffFile(rt)) onHandoffVerified(rt)
+    else maybeTimeout(rt, Date.now())
+    return
+  }
+  if (!rt.armed) return
+  if (!evaluateTrigger({ enabled: rt.cfg.enabled, ratio: rt.lastRatio, threshold: rt.cfg.contextThreshold, phase: rt.state.phase })) {
+    return
+  }
+  rt.armed = false
+  requestHandoff(rt)
+}
+
+export function noteAssistantUsage(rt: Runtime, usage: PiTokenUsage | null | undefined): void {
+  if (hasAuthoritativeUsage(usage)) {
+    rt.lastUsage = usage ?? null
+    rt.awaitingFreshUsage = false
+  }
+}
+
+export function noteToolStart(rt: Runtime): void {
+  rt.inFlightTools += 1
+}
+
+export function noteToolEnd(rt: Runtime): void {
+  rt.inFlightTools = Math.max(0, rt.inFlightTools - 1)
+  if (rt.pending && verifyHandoffFile(rt)) onHandoffVerified(rt)
 }
 
 export function onUserMessage(rt: Runtime, message: AgentMessageLike): void {
@@ -378,25 +438,29 @@ export function onUserMessage(rt: Runtime, message: AgentMessageLike): void {
   if (!rt.cycle.continuationText) return
   noteContinuationPrompted(rt.cycle, messageKey(message))
   if (rt.state.phase !== "monitoring") {
-    rt.state = reduce(rt.state, { type: "continuation-injected" })
+    rt.state = reduce(rt.state, { type: "cleared" })
   }
   rt.pending = null
 }
 
-export function runIdlePlan(rt: Runtime): "handoff" | "continuation" | "none" {
+/**
+ * Only remaining agent_end duty: when the handoff file is already written and the
+ * model has stopped, relight the same session via a real user message (JSONL).
+ */
+export function runIdlePlan(rt: Runtime): "continuation" | "none" {
   if (rt.injecting) return "none"
   if (rt.inFlightTools > 0) return "none"
-  considerTrigger(rt)
-  const plan = decideIdle(rt.cycle)
-  if (plan.kind === "none") return "none"
+  if (rt.pending && rt.state.phase === "injecting") {
+    if (!verifyHandoffFile(rt)) {
+      maybeTimeout(rt, Date.now())
+      return "none"
+    }
+    onHandoffVerified(rt)
+  }
   rt.injecting = true
   try {
-    if (plan.kind === "prompt-handoff") {
-      if (!rt.pending) return "none"
-      const text = render(rt.handoffPrompt, handoffVars(rt, rt.pending))
-      rt.hooks.sendUserMessage(text)
-      return "handoff"
-    }
+    const plan = decideIdle(rt.cycle)
+    if (plan.kind !== "prompt-continuation") return "none"
     rt.state = reduce(rt.state, { type: "cleared" })
     rt.log.log("info", "clearing", { sessionID: rt.sessionID ?? rt.hooks.sessionId?.(), via: "sendUserMessage" })
     rt.log.log("info", "messages-cleared", { kept: 1, mode: "prompt" })
@@ -407,12 +471,33 @@ export function runIdlePlan(rt: Runtime): "handoff" | "continuation" | "none" {
     })
     rt.hooks.sendUserMessage(plan.continuationText)
     notePersisted(rt.cycle)
-    rt.state = reduce(rt.state, { type: "continuation-injected" })
+    rt.state = reduce(rt.state, { type: "cleared" })
     rt.pending = null
+    rt.awaitingFreshUsage = true
+    rt.lastRatio = 0
+    rt.armed = false
     return "continuation"
   } finally {
     rt.injecting = false
   }
+}
+
+/** session_start restore: same --session-id restart pre-populates the cycle from the durable branch. */
+export function restoreFromBranch(rt: Runtime): boolean {
+  const found = scanContinuationMarker(rt)
+  if (!found) return false
+  rt.state = reduce(rt.state, { type: "cleared" })
+  rt.state.lastHandoffNumber = Math.max(rt.state.lastHandoffNumber, found.n)
+  if (cycleRequest(rt.cycle, found.n)) {
+    markWritten(rt.cycle, found.n, found.markerText)
+  }
+  rt.cycle.preClearIds = new Set(found.ids)
+  rt.cycle.phase = "filtering"
+  rt.awaitingFreshUsage = true
+  rt.lastRatio = 0
+  rt.armed = false
+  rt.log.log("info", "session-restored", { n: found.n, preClearCount: found.ids.length })
+  return true
 }
 
 export function statusSnapshot(rt: Runtime): Record<string, unknown> {
@@ -422,10 +507,9 @@ export function statusSnapshot(rt: Runtime): Record<string, unknown> {
     cycle: rt.cycle.phase,
     ratio: rt.lastRatio,
     threshold: rt.cfg.contextThreshold,
-    hardCeiling: rt.cfg.hardCeiling,
     inFlightTools: rt.inFlightTools,
     pending: rt.pending?.path ?? null,
     sessionID: rt.sessionID ?? rt.hooks.sessionId?.() ?? null,
-    turnsSinceHandoff: rt.state.turnsSinceHandoff,
+    injectCount: rt.injectCount,
   }
 }

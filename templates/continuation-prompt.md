@@ -1,9 +1,16 @@
-Continue the same task in this same Pi session. Prior chat history has been dropped from the model context on purpose.
+[pi-auto-handoff continuation {{continuationNumber}}] Prior chat history was dropped from the model context on purpose — you are the successor instance of the same run, in the same working session. The full handoff document is inlined below; the plan file path is also given. Do NOT re-read the handoff file from disk, and do not ask a human anything.
 
-Read, in order:
-1. Handoff: `{{handoffPath}}`
-2. Plan: `{{planFile}}`
+Resume from the handoff's "Exact interrupt point" and "Next actions". Do not restart finished work packages. If the handoff and the plan file disagree, trust the plan file and note the mismatch in your next edit to the plan.
 
-Resume from the next incomplete work package. Do not restart finished WPs. Do not ask a human to confirm. If the handoff and plan disagree, trust the plan file's WP table and note the mismatch in your next edit to the plan.
+- Plan file: `{{planFile}}`
+- Original handoff (also on disk at `{{handoffPath}}` if you ever need it):
 
-Do not write another handoff file unless a new handoff prompt names an exact unused path. Do not re-read the handoff and plan in a loop.
+----- BEGIN HANDOFF {{handoffNumber}} -----
+
+{{handoffBody}}
+
+----- END HANDOFF {{handoffNumber}} -----
+
+Continue the task now.
+
+<!-- pi-auto-handoff-continuation n={{continuationNumber}} -->

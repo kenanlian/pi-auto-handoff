@@ -1,11 +1,9 @@
 {
   "enabled": true,
   "contextThreshold": 0.5,
-  "hardCeiling": 0.75,
   "assumedContextLimit": 200000,
   "handoffDir": ".pi/handoff",
   "planFile": ".pi/plan/active-plan.md",
-  "minTurnsBetweenHandoffs": 3,
   "logging": true,
   "handoffTimeoutMs": 90000
 }
