@@ -210,8 +210,8 @@ const report = {
 	plan: existsSync(planFile) ? readFileSync(planFile, "utf8") : null,
 }
 
-mkdirSync(join(root, ".dev/spike-evidence"), { recursive: true })
-write(join(root, ".dev/spike-evidence/smoke-report.json"), JSON.stringify(report, null, 2))
+mkdirSync(join(root, ".smoke-reports"), { recursive: true })
+write(join(root, ".smoke-reports/smoke-report.json"), JSON.stringify(report, null, 2))
 
 if (failures.length > 0) {
 	console.error(JSON.stringify(report, null, 2))

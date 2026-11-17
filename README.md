@@ -1,5 +1,7 @@
 # pi-auto-handoff (v2)
 
+Development records no longer require a companion-directory link. Smoke diagnostics are retained in `.smoke-reports/smoke-report.json`; temporary smoke work remains in `.smoke/`. Historical records are archived outside this checkout.
+
 Pi **0.85.x** extension that performs **handoff → drop active model context → continue** while keeping the **same process PID and logical session id** — triggered **mid-run** from the `context` event, no run boundary required.
 
 v2 trigger shape: **one threshold** (`contextThreshold`, default `0.5`). When context occupancy exceeds the threshold while the run is still going, the next `context` event (fired before every LLM call) appends a strong handoff directive to that very call's message array. The model never has to reach a text-only turn first. Because the injected message does not persist in session state, the ratio stays over-threshold and the directive is **re-injected on every subsequent LLM call** until the handoff file is verified — the instruction stays in the room; the model cannot "forget" it.

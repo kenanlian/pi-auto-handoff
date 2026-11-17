@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.log
 .smoke/
+.smoke-reports/
 .dev/
 .pi/handoff/
 .pi/plan/
